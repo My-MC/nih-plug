@@ -3153,20 +3153,38 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
         let length = u64::from_le_bytes(length_bytes);
 
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
-        if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
-            nih_debug_assert_failure!(
-                "Error or end of stream while reading the state buffer from the stream."
-            );
+        // The length prefix comes from untrusted data (corrupted project files, fuzzing hosts),
+        // so never allocate it up front: reject absurd sizes and grow the buffer only as data
+        // actually arrives.
+        const MAX_STATE_LENGTH: u64 = 1 << 30;
+        const READ_CHUNK: usize = 64 * 1024;
+        if length > MAX_STATE_LENGTH {
+            nih_debug_assert_failure!("State length {} is too large, ignoring the state", length);
             return false;
         }
-        read_buffer.set_len(length as usize);
+        let length = length as usize;
+        let mut read_buffer: Vec<u8> = Vec::with_capacity(length.min(READ_CHUNK));
+        while read_buffer.len() < length {
+            let chunk_len = (length - read_buffer.len()).min(READ_CHUNK);
+            let start = read_buffer.len();
+            read_buffer.resize(start + chunk_len, 0);
+            if !read_stream(&*stream, &mut read_buffer[start..]) {
+                nih_debug_assert_failure!(
+                    "Error or end of stream while reading the state buffer from the stream."
+                );
+                return false;
+            }
+        }
 
         match state::deserialize_json(&read_buffer) {
             Some(mut state) => {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+                    // Loading state changes parameter values behind the host's back, so tell it to
+                    // re-read them (CLAP_PARAM_RESCAN_VALUES).
+                    let task_posted = wrapper.schedule_gui(Task::RescanParamValues);
+                    nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
                 }
 
                 success
